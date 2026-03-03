@@ -8,22 +8,33 @@ from curl_cffi import requests as curl_requests
 # === Configuration & Constants ===
 
 # Hardcoded Proxy Map
-# Ensure the proxy URL format is correct for curl_cffi (usually http://user:pass@host:port)
 PROXIES = {
-    "default": {"https": "http://localhost:3128", "http": "http://localhost:3128"},
+    "default": {"https": "socks5h://localhost:40000", "http": "socks5h://localhost:40000"},
+    "test": {"http": "http://172.66.45.9:80"},
     "none": None,
 }
 
 # Browser Impersonation Allowlist
-ALLOWED_IMPERSONATIONS = {"chrome131_android", "safari260_ios", "firefox144", "chrome142", "safari260", "realworld"}
-DEFAULT_IMPERSONATION = "chrome142"
+ALLOWED_IMPERSONATIONS = {"chrome131_android", "safari260_ios", "firefox147", "chrome145", "safari260"}
+DEFAULT_IMPERSONATION = "chrome131_android"
 
 # Max Response Size (10 MB)
-MAX_RESPONSE_BYTES = 10 * 1024 * 1024 
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
-# Headers to strictly remove to prevent conflicts or protocol errors
-HOP_BY_HOP_HEADERS = {
-    "host",
+# Headers that are safe to forward even when impersonating.
+# These carry session/auth/body data and don't affect the browser fingerprint.
+PASSTHROUGH_HEADERS = {
+    "cookie",
+    "authorization",
+    "x-requested-with",
+    "origin",
+    "referer",
+    "content-type",      # Required so the server knows the body format (e.g. application/json)
+    "content-length",    # Required for POST/PUT body framing
+}
+
+# Headers to strip from upstream responses before returning to client.
+HOP_BY_HOP_RESPONSE_HEADERS = {
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -32,9 +43,8 @@ HOP_BY_HOP_HEADERS = {
     "trailers",
     "transfer-encoding",
     "upgrade",
-    "content-length", # We let the systems recalculate this
-    "content-encoding", # We let curl decode, so we shouldn't pass this back unless we re-encode
-    "accept-encoding",  # We let curl handle compression negotiation
+    "content-length",    # Let FastAPI/Starlette recalculate
+    "content-encoding",  # curl_cffi already decoded the body
 }
 
 # Setup basic logging
@@ -46,28 +56,47 @@ app = FastAPI(title="Curl_CFFI Secure Proxy")
 
 # === Helper Functions ===
 
-def normalize_headers(headers: dict) -> dict:
+def get_request_headers(client_headers: dict, impersonate: str) -> dict:
     """
-    Strips hop-by-hop headers and low-level transport headers
-    that usually cause 400 Bad Request or 502 errors if forwarded blindly.
+    When impersonation is active, curl_cffi sets its own browser-realistic
+    headers (User-Agent, Accept, Accept-Encoding, sec-ch-ua, sec-fetch-*, etc.).
+    Forwarding the raw client headers on top of those overrides the fingerprint
+    and breaks impersonation.
+
+    Strategy:
+    - Impersonation active  → only pass through safe, session-related headers
+                              (cookie, authorization, etc.) so the fingerprint stays intact.
+    - No impersonation      → forward all client headers minus hop-by-hop ones.
     """
-    clean = {}
-    for k, v in headers.items():
-        if k.lower() not in HOP_BY_HOP_HEADERS:
-            clean[k] = v
-    return clean
+    if impersonate:
+        # Only keep headers that carry session/auth data
+        return {
+            k: v for k, v in client_headers.items()
+            if k.lower() in PASSTHROUGH_HEADERS
+        }
+    else:
+        # No impersonation: strip hop-by-hop but forward everything else
+        hop_by_hop = {
+            "host", "connection", "keep-alive", "proxy-authenticate",
+            "proxy-authorization", "te", "trailers", "transfer-encoding",
+            "upgrade", "content-length", "content-encoding", "accept-encoding",
+        }
+        return {k: v for k, v in client_headers.items() if k.lower() not in hop_by_hop}
+
+
+def normalize_response_headers(headers: dict) -> dict:
+    """Strip hop-by-hop headers from the upstream response."""
+    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_RESPONSE_HEADERS}
+
 
 def validate_request(url: str, proxy_key: str, impersonate: str):
     """Checks input validity, raises HTTPException on failure."""
-    # 1. Validate URL
     if not url or not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid or missing 'url'. Must start with http/https.")
-    
-    # 2. Validate Proxy
+
     if proxy_key not in PROXIES:
         raise HTTPException(status_code=400, detail=f"Invalid 'proxy'. Allowed: {list(PROXIES.keys())}")
-    
-    # 3. Validate Impersonate
+
     if impersonate not in ALLOWED_IMPERSONATIONS:
         raise HTTPException(status_code=400, detail=f"Invalid 'impersonate'. Allowed: {list(ALLOWED_IMPERSONATIONS)}")
 
@@ -78,80 +107,74 @@ def validate_request(url: str, proxy_key: str, impersonate: str):
 async def fetch_endpoint(request: Request):
     # --- 1. Extract & Validate Parameters ---
     target_url = request.query_params.get("url")
-    proxy_key = request.query_params.get("proxy", "none")
+    proxy_key = request.query_params.get("proxy", "default")
     impersonate = request.query_params.get("impersonate", DEFAULT_IMPERSONATION)
 
     validate_request(target_url, proxy_key, impersonate)
-    
+
     # --- 2. Prepare Request Data ---
-    # Get client headers and strip dangerous ones
-    client_headers = normalize_headers(dict(request.headers))
-    
+    # Only forward headers that won't interfere with the impersonation fingerprint
+    outgoing_headers = get_request_headers(dict(request.headers), impersonate)
+
     # Get body (if any)
     client_body = await request.body()
-    
+
     # Select Proxy
     target_proxy = PROXIES[proxy_key]
 
+    logger.info(f"Fetching {request.method} {target_url} | impersonate={impersonate} | proxy={proxy_key}")
+
     # --- 3. Execute Request (Streaming Mode) ---
     try:
-        # We use a Session context for safety, though a direct call works too.
-        # stream=True is ESSENTIAL for the size limit check.
         with curl_requests.Session() as s:
             response = s.request(
                 method=request.method,
                 url=target_url,
-                headers=client_headers,
+                headers=outgoing_headers,  # fingerprint-safe headers only
                 data=client_body,
                 proxies=target_proxy,
                 impersonate=impersonate,
-                timeout=30,  # 30s timeout
-                stream=True, # Start reading headers immediately, don't wait for body
-                allow_redirects=True
+                timeout=30,
+                stream=True,
+                allow_redirects=True,
             )
 
             # --- 4. Size Limit Check (Early Abort) ---
-            # Check Content-Length header first if available
             cl_header = response.headers.get("content-length")
             if cl_header:
                 try:
                     if int(cl_header) > MAX_RESPONSE_BYTES:
                         raise HTTPException(status_code=413, detail="Response too large (Header)")
                 except ValueError:
-                    pass # Ignore bad header, check actual stream
+                    pass  # Bad header value — fall through to stream check
 
-            # Read content in chunks to enforce limit on streams/unknown lengths
             content_accumulator = bytearray()
             for chunk in response.iter_content(chunk_size=8192):
                 content_accumulator.extend(chunk)
                 if len(content_accumulator) > MAX_RESPONSE_BYTES:
-                    # Abort connection immediately
                     raise HTTPException(status_code=413, detail="Response too large (Stream limit exceeded)")
 
-            # Final body content
             final_content = bytes(content_accumulator)
-            
+
             # --- 5. Prepare Response ---
-            # Clean up upstream headers (remove Transfer-Encoding, etc.)
-            upstream_headers = normalize_headers(dict(response.headers))
+            upstream_headers = normalize_response_headers(dict(response.headers))
 
             return Response(
                 content=final_content,
                 status_code=response.status_code,
                 headers=upstream_headers,
-                media_type=response.headers.get("content-type")
+                media_type=response.headers.get("content-type"),
             )
 
     except HTTPException:
-        raise # Re-raise known HTTP exceptions (like 413)
+        raise
 
     except Exception as e:
-        # Catch network/curl errors
         logger.error(f"Upstream error for {target_url}: {e}")
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
+
 
 # === Runner (for debugging) ===
 if __name__ == "__main__":
     import uvicorn
-    # Run: python main.py
     uvicorn.run(app, host="127.0.0.1", port=8000)
