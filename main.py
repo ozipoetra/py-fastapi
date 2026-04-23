@@ -173,6 +173,74 @@ async def fetch_endpoint(request: Request):
         logger.error(f"Upstream error for {target_url}: {e}")
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
 
+#== New Buzzheavier Endpoint ===
+
+@app.get("/api/buzz")
+async def buzzheavier_endpoint(request: Request):
+    """
+    Specific handler for Buzzheavier to bypass HTMX-based redirects.
+    Usage: /api/buzz?url=https://buzzheavier.com/5bxiamjqv78x
+    """
+    target_url = request.query_params.get("url")
+    proxy_key = request.query_params.get("proxy", "default")
+    impersonate = request.query_params.get("impersonate", DEFAULT_IMPERSONATION)
+
+    # Basic validation
+    if not target_url or "buzzheavier.com" not in target_url:
+        raise HTTPException(status_code=400, detail="Invalid Buzzheavier URL")
+
+    # Clean URL and construct the download path
+    base_url = target_url.strip().rstrip("/")
+    download_endpoint = f"{base_url}/download?alt=true"
+    
+    # Select Proxy
+    target_proxy = PROXIES.get(proxy_key)
+
+    try:
+        # We use a Session to maintain the browser fingerprint via curl_cffi
+        with curl_requests.Session() as s:
+            # Custom headers specifically for Buzzheavier's HTMX setup
+            custom_headers = {
+                "HX-Request": "true",
+                "HX-Current-URL": base_url,
+                "Referer": base_url,
+                "Accept": "*/*",
+            }
+            
+            # Merge with any incoming auth/session headers if present
+            incoming_safe = get_request_headers(dict(request.headers), impersonate)
+            custom_headers.update(incoming_safe)
+
+            response = s.get(
+                url=download_endpoint,
+                headers=custom_headers,
+                proxies=target_proxy,
+                impersonate=impersonate,
+                timeout=15,
+                allow_redirects=False  # We want to catch the hx-redirect header
+            )
+
+            # Look for the redirect in headers
+            # Note: curl_cffi headers are case-insensitive dicts
+            hx_redirect = response.headers.get("hx-redirect")
+
+            if hx_redirect:
+                logger.info(f"Buzz Redirect Found: {hx_redirect}")
+                return Response(
+                    status_code=302,
+                    headers={"Location": hx_redirect}
+                )
+            
+            # If it's a 204 but no header, or a 404, return the debug info
+            return Response(
+                content=f"Redirect header not found. Status: {response.status_code}",
+                status_code=502,
+                media_type="text/plain"
+            )
+
+    except Exception as e:
+        logger.error(f"Buzzheavier error: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 # === Runner (for debugging) ===
 if __name__ == "__main__":
