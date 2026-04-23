@@ -9,7 +9,7 @@ from curl_cffi import requests as curl_requests
 
 # Hardcoded Proxy Map
 PROXIES = {
-    "default": {"https": "socks5h://localhost:40000", "http": "socks5h://localhost:40000"},
+    "default": {"https": "http://localhost:40000", "http": "http://localhost:40000"},
     "test": {"http": "http://172.66.45.9:80"},
     "none": None,
 }
